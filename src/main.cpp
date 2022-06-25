@@ -15,27 +15,29 @@ Data Stack size         : 16
 #include <avr/eeprom.h>
 
 // Declare your global variables here
-#define KEY           (!(PINB & _BV(PB4)))
+#define KEY           (!(PINB & _BV(PB2)))
 #define PWM_A PB0
 #define PWM_B PB1
 
 #define _SET(bit)      PORTB |= (1 << bit)
 #define _CLEAR(bit)    PORTB &= ~(1 << bit)
 
-#define TIMER_RESOLUTION 0.0002133
+// prescaler: 1,8,64 (PWM frequencies (@1.2MHz): 4.687kHz, 585Hz, 73Hz)
+#define TIMER_PRESCALER 8
+#define TIMER_RESOLUTION (256.0 * TIMER_PRESCALER / F_CPU)
 
 // длинное нажатие (> 1 с)
-#define LONG_KEYPRESS ((uint16_t) (1 / TIMER_RESOLUTION))
+#define LONG_KEYPRESS ((uint16_t) (1.0 / TIMER_RESOLUTION))
 
 // короткое нажатие (> 0,04 с)
 #define KEYPRESS ((uint16_t) (0.04 / TIMER_RESOLUTION))
 
-// длительность двойного нажатия (в пределах 0,6 с)
-#define DOUBLECLICK_DELAY ((uint16_t) (0.6 / TIMER_RESOLUTION))
+// длительность двойного нажатия (в пределах 0,4 с)
+#define DOUBLECLICK_DELAY ((uint16_t) (0.4 / TIMER_RESOLUTION))
 
 // задержка изменения PWM (вкл/выкл)
-#define PWM_DELAY          ((uint16_t) (3.0 / 255.0 / TIMER_RESOLUTION))
-#define PWM_DELAY_OFF      ((uint16_t) (10.0 / 255.0 / TIMER_RESOLUTION))
+#define PWM_DELAY          ((uint16_t) (3.0 / (256 * TIMER_RESOLUTION)))
+#define PWM_DELAY_OFF      ((uint16_t) (7.5 / (256 * TIMER_RESOLUTION)))
 
 
 #define PWM_MODE ()
@@ -63,8 +65,8 @@ if (x == 0 || (lamp_mode & 0x02) == 0) {                                        
 unsigned int key_pressed_counter, doubleclick_counter, pwm_delay_counter;
 unsigned char key_pressed, singleclick;
 
-EEMEM unsigned char e_brightness, e_lamp_mode;
-unsigned char brightness, lamp_mode;
+EEMEM unsigned char e_brightness = 0xFF, e_lamp_mode = 0x03;
+unsigned char lamp_mode;
 
 unsigned char pwm;
 
@@ -94,18 +96,13 @@ uint8_t get_delay_counter(tMode mode) {
 uint8_t longpress;
 
 // Timer 0 overflow interrupt service routine
-ISR(TIM0_OVF_vect)
+ISR(TIM0_OVF_vect, ISR_NAKED)
 {
   if (pwm_delay_counter > 0) {
     pwm_delay_counter--;
   } else {
 
     if (longpress && mode == MODE_BRIGHTNESS) {
-      // if (pwm == 255) {
-      //    brightness_direction = -1;
-      // } else if (pwm == 50) {
-      //   brightness_direction = 1;
-      // }
       if (brightness_direction == 1 && pwm < 255) {
         pwm++;
       } else if (brightness_direction == -1 && pwm > 50) {
@@ -115,25 +112,18 @@ ISR(TIM0_OVF_vect)
 
     pwm_delay_counter = get_delay_counter(mode);
 
-    unsigned char _pwma, _ocr0a;
-    _pwma = pwm;
-    _ocr0a = OCR0A;
-    if (OCR0A < _pwma) {
-      _ocr0a = OCR0A + 1;
-    } else if (OCR0A > _pwma) {
-      _ocr0a = OCR0A - 1;
+    unsigned _ocr0ab;
+    _ocr0ab = OCR0A;
+    if (OCR0A < pwm) {
+      _ocr0ab = OCR0A + 1;
+    } else if (OCR0A > pwm) {
+      _ocr0ab = OCR0A - 1;
+    } else if (!longpress) { // remove if for cycling brightness
+      mode = MODE_NONE;
     }
-    SET_PWM_A(_ocr0a);
+    SET_PWM_A(_ocr0ab);
+    SET_PWM_B(_ocr0ab);
 
-    unsigned char _pwmb, _ocr0b;
-    _pwmb = pwm;
-    _ocr0b = OCR0B;
-    if (OCR0B < _pwmb) {
-      _ocr0b = OCR0B + 1;
-    } else if (OCR0B > _pwmb) {
-      _ocr0b = OCR0B - 1;
-    }
-    SET_PWM_B(_ocr0b);
   }
 
   if ((OCR0A == 255 && mode == MODE_ON) || (OCR0A == 0 && mode == MODE_OFF)) {
@@ -166,19 +156,26 @@ ISR(TIM0_OVF_vect)
   } else {
     key_pressed = 0;
     if (key_pressed_counter > LONG_KEYPRESS) {
+
       // длинное нажатие закончено (шаг яркости меняется на противоположный)
       singleclick = 0;
       longpress = 0;
       mode = MODE_NONE;
       brightness_direction = -brightness_direction;
+
+      // save brightness to eeprom
+      eeprom_write_byte(&e_brightness, pwm);
+
     } else if (key_pressed_counter > KEYPRESS) {
       if (doubleclick_counter > 0) {
-      // двойное нажатие с защитой от дребезга
+        // двойное нажатие с защитой от дребезга
         doubleclick_counter = 0;        
         // set lamp mode
         if (pwm > 0) {
           lamp_mode = (lamp_mode + 1) & 0x03;
           if (lamp_mode == 0) lamp_mode++;
+          // save lamp mode
+          eeprom_write_byte(&e_lamp_mode, lamp_mode);
         }
       } else {
         doubleclick_counter = DOUBLECLICK_DELAY;
@@ -189,7 +186,9 @@ ISR(TIM0_OVF_vect)
       if (pwm == 0) {
         // turn on
         mode = MODE_ON;
-        pwm = 255;
+        // read pwm from eeprom
+        pwm = eeprom_read_byte(&e_brightness);
+        if (pwm < 50) pwm = 50;
       } else {
         // turn off
         mode = MODE_OFF;
@@ -198,7 +197,7 @@ ISR(TIM0_OVF_vect)
     }
     key_pressed_counter = 0;
   }
-
+  reti();
 }
 
 int main(void)
@@ -213,8 +212,8 @@ int main(void)
   // Port B initialization
   // Function: Bit5=In Bit4=In Bit3=In Bit2=In Bit1=Out Bit0=Out 
   DDRB=(0<<DDB5) | (0<<DDB4) | (0<<DDB3) | (0<<DDB2) | (1<<DDB1) | (1<<DDB0);
-  // State: Bit5=T Bit4=P Bit3=T Bit2=T Bit1=0 Bit0=0 
-  PORTB=(0<<PORTB5) | (1<<PORTB4) | (0<<PORTB3) | (0<<PORTB2) | (0<<PORTB1) | (0<<PORTB0);
+  // State: Bit5=T Bit4=T Bit3=T Bit2=P Bit1=0 Bit0=0 
+  PORTB=(0<<PORTB5) | (0<<PORTB4) | (0<<PORTB3) | (1<<PORTB2) | (0<<PORTB1) | (0<<PORTB0);
 
   // Timer/Counter 0 initialization
   // Clock source: System Clock
@@ -222,11 +221,17 @@ int main(void)
   // Mode: Fast PWM top=0xFF
   // OC0A output: Non-Inverted PWM
   // OC0B output: Non-Inverted PWM
-  // Timer Period: 0,21333 ms
-  // Output Pulse(s):
-  // OC0A Period: 0,21333 ms Width: 0 us
+  // Timer Period: (256 * TIMER_PRESCALER / F_CPU)
   TCCR0A=(1<<COM0A1) | (0<<COM0A0) | (1<<COM0B1) | (0<<COM0B0) | (1<<WGM01) | (1<<WGM00);
+  #if TIMER_PRESCALER == 1
   TCCR0B=(0<<WGM02) | (0<<CS02) | (0<<CS01) | (1<<CS00);
+  #elif TIMER_PRESCALER == 8
+  TCCR0B=(0<<WGM02) | (0<<CS02) | (1<<CS01) | (0<<CS00);
+  #elif TIMER_PRESCALER == 64
+  TCCR0B=(0<<WGM02) | (0<<CS02) | (1<<CS01) | (1<<CS00);
+  #elif
+  #error "prescaler not supported"
+  #endif
   TCNT0=0x00;
   OCR0A=0x00;
   OCR0B=0x00;
@@ -256,20 +261,16 @@ int main(void)
   // ADC disabled
   ADCSRA=(0<<ADEN) | (0<<ADSC) | (0<<ADATE) | (0<<ADIF) | (0<<ADIE) | (0<<ADPS2) | (0<<ADPS1) | (0<<ADPS0);
 
-  brightness = eeprom_read_byte(&e_brightness);
-  pwm = brightness;
   brightness_direction = 1;
 
   lamp_mode = eeprom_read_byte(&e_lamp_mode);
   if (lamp_mode == 0) lamp_mode = 0x03;
 
   mode = MODE_NONE;
-  // if (pwm == 0) {
-  //   pwm = 255;
-  // }
+  pwm = 0;
 
   // Global enable interrupts
   sei();
 
-  while (1) {};
+  while(1) {};
 }
