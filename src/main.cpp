@@ -14,10 +14,15 @@ Data Stack size         : 16
 #include <util/delay.h>
 #include <avr/eeprom.h>
 
+// single channel pwm
+//#define SINGLE_CHANNEL
+
 // Declare your global variables here
 #define KEY           (!(PINB & _BV(PB2)))
 #define PWM_A PB0
+#ifndef SINGLE_CHANNEL
 #define PWM_B PB1
+#endif
 
 #define _SET(bit)      PORTB |= (1 << bit)
 #define _CLEAR(bit)    PORTB &= ~(1 << bit)
@@ -26,21 +31,39 @@ Data Stack size         : 16
 #define TIMER_PRESCALER 8
 #define TIMER_RESOLUTION (256.0 * TIMER_PRESCALER / F_CPU)
 
-// длинное нажатие (> 1 с)
-#define LONG_KEYPRESS ((uint16_t) (1.0 / TIMER_RESOLUTION))
+// длинное нажатие (> 0,5 с)
+#define LONG_KEYPRESS ((uint16_t) (0.5 / TIMER_RESOLUTION))
 
 // короткое нажатие (> 0,04 с)
 #define KEYPRESS ((uint16_t) (0.04 / TIMER_RESOLUTION))
 
-// длительность двойного нажатия (в пределах 0,4 с)
-#define DOUBLECLICK_DELAY ((uint16_t) (0.4 / TIMER_RESOLUTION))
+#ifndef SINGLE_CHANNEL
+// длительность двойного нажатия (в пределах 0,3 с)
+#define DOUBLECLICK_DELAY ((uint16_t) (0.3 / TIMER_RESOLUTION))
+#endif
 
 // задержка изменения PWM (вкл/выкл)
 #define PWM_DELAY          ((uint16_t) (3.0 / (256 * TIMER_RESOLUTION)))
 #define PWM_DELAY_OFF      ((uint16_t) (7.5 / (256 * TIMER_RESOLUTION)))
 
+// min brightness
+#define PWM_MIN 50
+// max brigthness
+#define PWM_MAX 255
 
-#define PWM_MODE ()
+#ifdef SINGLE_CHANNEL
+
+#define SET_PWM_A(x)                                                                          \
+OCR0A = x;                                                                                    \
+if (x == 0) {                                                                                 \
+    TCCR0A = (0<<COM0B1) | (0<<COM0B0) | (0<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00); \
+    _CLEAR(PWM_A);                                                                            \
+} else {                                                                                      \
+    TCCR0A = (0<<COM0B1) | (0<<COM0B0) | (1<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00); \
+}                                                                                             \
+
+#else
+
 #define MASK_PWM_A ((1<<COM0A1) | (1<<COM0A0))
 #define MASK_PWM_B ((1<<COM0B1) | (1<<COM0B0))
 
@@ -48,9 +71,9 @@ Data Stack size         : 16
 OCR0A = x;                                                                                  \
 if (x == 0 || (lamp_mode & 0x01) == 0) {                                                    \
     TCCR0A = (TCCR0A & MASK_PWM_B) | (0<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00);   \
-    _CLEAR(PWM_B);                                                                          \
+    _CLEAR(PWM_A);                                                                          \
 } else {                                                                                    \
-    TCCR0A = (TCCR0A & MASK_PWM_B) | (1<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00);  \
+    TCCR0A = (TCCR0A & MASK_PWM_B) | (1<<COM0A1) | (0<<COM0A0) | (1<<WGM01) | (1<<WGM00);   \
 }                                                                                           \
 
 #define SET_PWM_B(x)                                                                        \
@@ -62,19 +85,32 @@ if (x == 0 || (lamp_mode & 0x02) == 0) {                                        
     TCCR0A = (TCCR0A & MASK_PWM_A) | (1<<COM0B1) | (0<<COM0B0) | (1<<WGM01) | (1<<WGM00);   \
 }                                                                                           \
 
-unsigned int key_pressed_counter, doubleclick_counter, pwm_delay_counter;
-unsigned char key_pressed, singleclick;
+#endif
 
-EEMEM unsigned char e_brightness = 0xFF, e_lamp_mode = 0x03;
-unsigned char lamp_mode;
+uint16_t key_pressed_counter;
+uint8_t key_pressed, pwm_delay_counter;
 
-unsigned char pwm;
+#ifndef SINGLE_CHANNEL
+uint16_t doubleclick_counter;
+uint8_t singleclick;
+#endif
+
+uint8_t longpress;
+uint8_t turn_on_fl;
+
+#ifndef SINGLE_CHANNEL
+uint8_t lamp_mode;
+#endif
+
+uint8_t pwm;
 
 int8_t brightness_direction;
 
+EEMEM uint8_t e_brightness = 0xFF, e_lamp_mode = 0x03;
+
 typedef enum
 {
-  MODE_NONE = 0,
+  MODE_IDLE = 0,
   MODE_ON,
   MODE_OFF,
   MODE_BRIGHTNESS,
@@ -93,19 +129,19 @@ uint8_t get_delay_counter(tMode mode) {
   return 0;
 }
 
-uint8_t longpress;
 
 // Timer 0 overflow interrupt service routine
 ISR(TIM0_OVF_vect, ISR_NAKED)
 {
+
   if (pwm_delay_counter > 0) {
     pwm_delay_counter--;
   } else {
 
     if (longpress && mode == MODE_BRIGHTNESS) {
-      if (brightness_direction == 1 && pwm < 255) {
+      if (brightness_direction == 1 && pwm < PWM_MAX) {
         pwm++;
-      } else if (brightness_direction == -1 && pwm > 50) {
+      } else if (brightness_direction == -1 && pwm > PWM_MIN) {
         pwm--;
       }
     }
@@ -119,36 +155,39 @@ ISR(TIM0_OVF_vect, ISR_NAKED)
     } else if (OCR0A > pwm) {
       _ocr0ab = OCR0A - 1;
     } else if (!longpress) { // remove if for cycling brightness
-      mode = MODE_NONE;
+      mode = MODE_IDLE;
     }
     SET_PWM_A(_ocr0ab);
+#ifndef SINGLE_CHANNEL
     SET_PWM_B(_ocr0ab);
-
+#endif
   }
 
-  if ((OCR0A == 255 && mode == MODE_ON) || (OCR0A == 0 && mode == MODE_OFF)) {
-    mode = MODE_NONE;
+  if ((OCR0A == PWM_MAX && mode == MODE_ON) || (OCR0A == 0 && mode == MODE_OFF)) {
+    mode = MODE_IDLE;
   }
 
   if (key_pressed && key_pressed_counter < 65535) {
     key_pressed_counter++;
   }
                  
+#ifndef SINGLE_CHANNEL
   if (doubleclick_counter > 0) {
     doubleclick_counter--;
     singleclick = doubleclick_counter == 0;
   }
+#endif
 
   if (KEY) {
     key_pressed = 1;
     if (key_pressed_counter > LONG_KEYPRESS) {
       // длинное нажатие продолжается (изменение яркости)
       longpress = 1;
-      if (mode == MODE_NONE) {
+      if (mode == MODE_IDLE && pwm != 0) {
         mode = MODE_BRIGHTNESS;
-        if (pwm == 255) {
+        if (pwm == PWM_MAX) {
           brightness_direction = -1;
-        } else if (pwm == 50) {
+        } else if (pwm == PWM_MIN) {
           brightness_direction = 1;
         }
       }
@@ -156,23 +195,30 @@ ISR(TIM0_OVF_vect, ISR_NAKED)
   } else {
     key_pressed = 0;
     if (key_pressed_counter > LONG_KEYPRESS) {
-
       // длинное нажатие закончено (шаг яркости меняется на противоположный)
+#ifndef SINGLE_CHANNEL
       singleclick = 0;
+#endif
       longpress = 0;
-      mode = MODE_NONE;
-      brightness_direction = -brightness_direction;
+      if (mode == MODE_BRIGHTNESS) {
+        mode = MODE_IDLE;
+        brightness_direction = -brightness_direction;
 
-      // save brightness to eeprom
-      eeprom_write_byte(&e_brightness, pwm);
+        // save brightness to eeprom
+        eeprom_write_byte(&e_brightness, pwm);
+      } else if (mode == MODE_IDLE && pwm == 0) {
+        turn_on_fl = 1;
+      }
 
     } else if (key_pressed_counter > KEYPRESS) {
+#ifndef SINGLE_CHANNEL
       if (doubleclick_counter > 0) {
         // двойное нажатие с защитой от дребезга
         doubleclick_counter = 0;        
         // set lamp mode
-        if (pwm > 0) {
-          lamp_mode = (lamp_mode + 1) & 0x03;
+        if (pwm != 0) {
+          lamp_mode++;
+          lamp_mode &= 0x03;
           if (lamp_mode == 0) lamp_mode++;
           // save lamp mode
           eeprom_write_byte(&e_lamp_mode, lamp_mode);
@@ -183,12 +229,9 @@ ISR(TIM0_OVF_vect, ISR_NAKED)
     } else if (singleclick) {
       // короткое нажатие с защитой от дребезга
       singleclick = 0;
+#endif
       if (pwm == 0) {
-        // turn on
-        mode = MODE_ON;
-        // read pwm from eeprom
-        pwm = eeprom_read_byte(&e_brightness);
-        if (pwm < 50) pwm = 50;
+        turn_on_fl = 1;
       } else {
         // turn off
         mode = MODE_OFF;
@@ -196,6 +239,16 @@ ISR(TIM0_OVF_vect, ISR_NAKED)
       }
     }
     key_pressed_counter = 0;
+  }
+  if (turn_on_fl != 0) {
+    turn_on_fl = 0;
+    // turn on
+    mode = MODE_ON;
+    // read pwm from eeprom
+    pwm = eeprom_read_byte(&e_brightness);
+    if (pwm < PWM_MIN) {
+      pwm = PWM_MIN;
+    }
   }
   reti();
 }
@@ -263,10 +316,12 @@ int main(void)
 
   brightness_direction = 1;
 
+#ifndef SINGLE_CHANNEL
   lamp_mode = eeprom_read_byte(&e_lamp_mode);
   if (lamp_mode == 0) lamp_mode = 0x03;
+#endif
 
-  mode = MODE_NONE;
+  mode = MODE_IDLE;
   pwm = 0;
 
   // Global enable interrupts
